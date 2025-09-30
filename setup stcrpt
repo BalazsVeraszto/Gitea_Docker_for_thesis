@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== CONFIG =====
+WORKDIR="$PWD/jenkins-setup"
+mkdir -p "$WORKDIR/jenkins/init.groovy.d"
+
+# ===== LOAD ENV =====
+if [ ! -f .env ]; then
+  echo "❌ Missing .env file. Create one with:"
+  echo "JENKINS_ADMIN_USER, JENKINS_ADMIN_PASS, GITEA_BOT_USER, GITEA_BOT_TOKEN, GITEA_ORG, REPO_NAME, GITEA_HTTP_PORT, HOST_IP, TARGET_BRANCH"
+  exit 1
+fi
+
+set -o allexport
+source .env
+set +o allexport
+
+# Verify essential variables
+: "${REPO_NAME:?REPO_NAME is not set in .env}"
+: "${JENKINS_ADMIN_USER:?JENKINS_ADMIN_USER not set}"
+: "${JENKINS_ADMIN_PASS:?JENKINS_ADMIN_PASS not set}"
+: "${GITEA_BOT_USER:?GITEA_BOT_USER not set}"
+: "${GITEA_BOT_TOKEN:?GITEA_BOT_TOKEN not set}"
+: "${GITEA_ORG:?GITEA_ORG not set}"
+: "${GITEA_HTTP_PORT:?GITEA_HTTP_PORT not set}"
+: "${HOST_IP:?HOST_IP not set}"
+: "${TARGET_BRANCH:?TARGET_BRANCH not set}"
+
+# ===== DOCKERFILE =====
+cat > "$WORKDIR/Dockerfile" <<'EOF'
+FROM jenkins/jenkins:lts
+USER root
+COPY jenkins/plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
+USER jenkins
+EOF
+
+# ===== PLUGINS =====
+cat > "$WORKDIR/jenkins/plugins.txt" <<'EOF'
+workflow-aggregator
+git
+credentials-binding
+job-dsl
+EOF
+
+# ===== DOCKER-COMPOSE =====
+cat > "$WORKDIR/docker-compose.yml" <<EOF
+version: '3.8'
+services:
+  jenkins:
+    build:
+      context: .
+    container_name: jenkins
+    user: root
+    ports:
+      - "${JENKINS_HTTP_PORT}:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jenkins/init.groovy.d:/var/jenkins_home/init.groovy.d:ro
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+volumes:
+  jenkins_home:
+EOF
+
+# ===== GROOVY INIT SCRIPT =====
+# Use double-quoted heredoc to allow bash variable expansion
+cat > "$WORKDIR/jenkins/init.groovy.d/01-init.groovy" <<EOF
+import jenkins.model.*
+import hudson.security.*
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.domains.*
+import com.cloudbees.plugins.credentials.impl.*
+import org.jenkinsci.plugins.workflow.job.WorkflowJob
+import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition
+
+def instance = Jenkins.getInstance()
+
+// Create admin user
+def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+if (!instance.getSecurityRealm().getUser("${JENKINS_ADMIN_USER}")) {
+    hudsonRealm.createAccount("${JENKINS_ADMIN_USER}", "${JENKINS_ADMIN_PASS}")
+    instance.setSecurityRealm(hudsonRealm)
+    def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+    strategy.setAllowAnonymousRead(false)
+    instance.setAuthorizationStrategy(strategy)
+    instance.save()
+}
+
+// Create Gitea bot credentials
+def store = Jenkins.instance.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0].getStore()
+if (!store.getCredentials(Domain.global()).any { it.id == "gitea-bot-cred" }) {
+    def cred = new UsernamePasswordCredentialsImpl(
+        CredentialsScope.GLOBAL,"gitea-bot-cred","Gitea bot","${GITEA_BOT_USER}","${GITEA_BOT_TOKEN}")
+    store.addCredentials(Domain.global(), cred)
+}
+
+// Create pipeline job
+def jobName = "${REPO_NAME}-pipeline"
+if (instance.getItem(jobName) == null) {
+    def job = instance.createProject(WorkflowJob, jobName)
+
+    def script = """
+pipeline {
+  agent { docker { image 'alpine/git' } }
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: '${TARGET_BRANCH}',
+            credentialsId: 'gitea-bot-cred',
+            url: 'http://${HOST_IP}:${GITEA_HTTP_PORT}/${GITEA_ORG}/${REPO_NAME}.git'
+      }
+    }
+    stage('Inject Snippet') {
+      steps {
+        script {
+          writeFile file: 'snippet.txt', text: "\\n// Injected by Jenkins at \${new Date()}", append: true
+        }
+      }
+    }
+    stage('Commit & Push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'gitea-bot-cred', usernameVariable: 'USER', passwordVariable: 'TOKEN')]) {
+          sh '''
+            set -e
+            git config user.name "jenkins-bot"
+            git config user.email "jenkins-bot@example.local"
+            branch=ci/snippet-\${BUILD_NUMBER}
+            git checkout -b \$branch || true
+            git add snippet.txt
+            git commit -m "ci: snippet injection" || true
+            git remote set-url origin http://\$USER:\$TOKEN@${HOST_IP}:${GITEA_HTTP_PORT}/${GITEA_ORG}/${REPO_NAME}.git
+            git push -u origin HEAD:\$branch
+          '''
+        }
+      }
+    }
+  }
+}
+"""
+    job.setDefinition(new CpsFlowDefinition(script,true))
+    job.save()
+    job.scheduleBuild2(0) // trigger first build automatically
+    println("✅ Pipeline job '\${jobName}' created and first build triggered")
+} else {
+    println("✅ Pipeline job '\${jobName}' already exists")
+}
+EOF
+
+# ===== BUILD + START =====
+cd "$WORKDIR"
+docker compose build --no-cache
+docker compose up -d
+
+# ===== WAIT FOR JENKINS =====
+echo -n "⏳ Waiting for Jenkins "
+MAX_WAIT=300
+WAITED=0
+JENKINS_URL="http://localhost:${JENKINS_HTTP_PORT}"
+until curl -s -u "${JENKINS_ADMIN_USER}:${JENKINS_ADMIN_PASS}" "${JENKINS_URL}/api/json" >/dev/null 2>&1; do
+  if [ $WAITED -ge $MAX_WAIT ]; then
+    echo "❌ Jenkins did not start within ${MAX_WAIT}s"
+    docker logs jenkins --tail 50
+    exit 1
+  fi
+  printf "."
+  sleep 5
+  WAITED=$((WAITED+5))
+done
+
+echo " ✅ Jenkins ready at ${JENKINS_URL}/"
+echo "   Admin: ${JENKINS_ADMIN_USER} / ${JENKINS_ADMIN_PASS}"
+echo "   Pipeline job: ${REPO_NAME}-pipeline (snippet injection branch)"
